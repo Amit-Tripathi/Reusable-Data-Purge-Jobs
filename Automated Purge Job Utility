@@ -1,0 +1,20 @@
+Scenario/Use Case:
+
+Business Context: Create a scheduled Job for centralizing purging objects based off of custom settings.
+Acceptance Criteria:
+Technical Details/Requirements: 
+Create central Job to purge data from organization as per specified configuration.
+Technical Design: 
+1. A batch class will be used for purging object records. This batch class will be on the lines of the Purge_Records batch class.
+2. The details of the object to purge and purge configuration settings will be kept into a custom setting. The Purge details include Object Name, Criteria, Threshold, Record Limit and isActive fields. Purge Configuration settings include isPurgingOn and isRandom flag, Query Limit & Query Row Limit fields.
+3. This batch will be started by the Batch Orchestrator. Alternatively, the user can externally schedule or execute Purge Records batch by passing parameter like Object Name, Criteria or Purge Limit. Externally scheduled or executed batch always execute independently without looking into Purge Details setting. If user has passed blank or invalid Object Name then this batch will be executing by looking into purge details setting.
+4. The start method of the batch will pick Purge Details Configuration from custom setting and will set the Query Limit(SOQL Query Limit is 200) and Query Row Limit(SOQL retrieve up to 50000 records) which will help us to ensure that we don't exceed sales force governor limits.
+5. We have 'isPurgingOn' master on/off switch, which will tell us whether to purge data or not from purge details setting. We also have isRandom flag field which will tell us whether to purge object records from custom setting randomly or sequentially.
+6. If externally scheduled or executed batch has failed then this batch will log the error details and exit from finish method.
+7. If isRandom flag is true then object records list for purging will be processed randomly. Then this batch will loop through each record and it will check i. whether the object has records meeting the purge criteria. ii. whether the records exceed the threshold specified in the custom setting.
+8. If all the above conditions are true, then the start method will query the object records and pass all above threshold records with given limit to an execute method. The execute method will purge the records passed to it in using QueryLocator.
+9. If records get failed while purging in execute method then log the failure details with record id into error log object and move cursor to finish method.
+10. This batch will execute for a single object record if criteria is met. The finish method of the batch re-executes the batch and then the batch executes for the next object to purge.
+11. If in the start method, the purge criteria and the threshold does not match for any object, then the batch fires a dummy query with an empty result. Thus, the execute method will not process any records as the start returned an empty QueryLocator. The batch will not be re-executed in the finish method in this case.
+12. Any exceptions encountered in the start or execute method are logged in the Batch Log object in the finish method.
+13. After execution is complete, the Batch Orchestrator is responsible for rescheduling the batch. This batch will be configured as a low priority batch in Batch Orchestrator and the Batch Orchestrator will keep on executing the batch daily or weekly based on slot availability.
