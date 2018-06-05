@@ -1,0 +1,320 @@
+/******************************************************************************************************************************
+ *
+ *	@File           : 	Batch_PurgeRecords.cls
+ *	@Version        : 	V1.0.0
+ *	@Last changed   : 	06 Nov 2014
+ *	@Purpose        : 	JIRA 4453
+ *
+ *						This batch mainly is used for purging records which are no longer required. Purge Object details are kept into Purge Details
+ *						custom setting with Criteria, Limit, Threshold fields. This batch will first fetch records from custom setting to decide which 
+ 						objects to purge. This batch can fetch records Sequentially or Randomly depending on Purge Configuration. 
+ *						The batch will keep on re-executing till all object records have been purged. The finish method of the batch will
+ 						re-exceute the same batch. Once a stage is reached where the Threshold criteria doesn't match for all objects
+ 						then this batch will exit.
+ *						
+ *
+ *	@Author         : 	Capgemini Offshore (Amit T, Sudarshan K)
+ *	@Copyright      : 	(c) Capgemini India Pvt. Ltd. 2014
+ *
+ *  @History		:  
+ *	06 Nov 2014 	:   Sudarshan K    :	CRMGPS-4453, Batch + Scheduler for purging records.
+ *  18 Dec 2014     :   Sudarshan K    :    Worked on Amit Reviewed Comment.
+ *	29 Dec 2014     :   Sudarshan K    :    Worked on Himanshu Reviewed Comment.
+  *	05 Jan 2015     :   Sudarshan K    :    Worked on Amit Reviewed Comments.
+ ********************************************************************************************************************************/
+
+global class Batch_PurgeRecords implements Database.Batchable<SObject>, Database.Stateful, schedulable {
+    
+    private String SOBJECT_NAME = ' ' ;
+	private String  WHERE_CLAUSE =' WHERE  ' ; 
+	private String  LIMIT_CLAUSE =' LIMIT 0 ';
+	private String WHERE_CLAUSE_VALUE = ' ';
+	private integer LIMIT_VALUE = 0;
+    //Salesforce Governor Limit Check: Query Row Limit = 50000 and Query Limit = 200
+    private integer QUERY_ROW_LIMIT = 49999;        
+    private integer QUERYLIMIT= 99;
+    private boolean isExit = false;
+    private boolean isExternallyDataPurge = false;
+    private List<Error_Log__c> lstErrorLog{
+        get{
+            if(lstErrorLog == null)
+            lstErrorLog = new List<Error_Log__c>();
+            return lstErrorLog;
+        }set;
+    }
+
+    public Batch_PurgeRecords(){ isExternallyDataPurge = false; }
+    
+	public Batch_PurgeRecords(String ObjectName, string WhereClause) {
+    	SOBJECT_NAME = ObjectName.trim();
+    	WHERE_CLAUSE = ' WHERE ' + WhereClause;
+    	LIMIT_CLAUSE =' ';
+    	WHERE_CLAUSE_VALUE = WhereClause;
+    	LIMIT_VALUE = 0;
+    	//isExternallyDataPurge = (Schema.getGlobalDescribe().get(SOBJECT_NAME) != null?true:false);
+    	isExternallyDataPurge = true;
+  	}
+  	
+  	public Batch_PurgeRecords(String ObjectName, string WhereClause,Integer numberOfRecordsToDelete) {
+    	SOBJECT_NAME = ObjectName.trim();
+    	WHERE_CLAUSE = ' WHERE ' + WhereClause;
+    	if(numberOfRecordsToDelete > 0)
+    		LIMIT_CLAUSE = ' LIMIT ' + numberOfRecordsToDelete;
+    	else
+    		LIMIT_CLAUSE =' ';
+    	WHERE_CLAUSE_VALUE = WhereClause;	
+    	LIMIT_VALUE = numberOfRecordsToDelete;
+    	//isExternallyDataPurge = (Schema.getGlobalDescribe().get(SOBJECT_NAME) != null?true:false);
+    	isExternallyDataPurge = true;
+  	}
+    	
+    /**
+     * Method:
+     * START
+     * 
+     * Summary:
+     * This method is implimentation of Database.Batchable interface which return the Query Locator.  
+     * Retrieve Records and pass to execute method.
+     *
+     * Parameters:
+     * @ Database.BatchableContext context
+     * 
+     * Return Type: 
+     * @ Database.QueryLocator
+     */
+    global Database.QueryLocator start(Database.BatchableContext context){
+        Database.QueryLocator recordSet = null;
+        Integer queryResultCount;
+        Integer threshold;
+        Integer recordLimit;
+        isExit = false;
+        try{
+	        if(isExternallyDataPurge){
+	        	isExit = true;
+	    		String queryStr = 'SELECT Id FROM ' + SOBJECT_NAME + ' ' +WHERE_CLAUSE + ' ' +LIMIT_CLAUSE;   
+	            return Database.getQueryLocator(queryStr);
+	        }else{
+		        //Below Custom setting used to get object list which used to purging records.
+		        List<Purge_Details__c> purgeDetailsSetting = new List<Purge_Details__c>();
+		        Purge_Details_Cofiguration__c purgeConfig = Purge_Details_Cofiguration__c.getInstance('Default');
+		        if(purgeConfig != null){
+		        	if(purgeConfig.isPurgingOn__c){
+		        		purgeDetailsSetting =  Purge_Details__c.getAll().values();
+			        	QUERY_ROW_LIMIT = Integer.valueOf(purgeConfig.Query_Row_Limit__c);
+			        	QUERYLIMIT = Integer.valueOf(purgeConfig.Query_Limit__c);
+			        	//Below Setting tell us to purge records randomly or Sequencially.
+			        	if(purgeConfig.isRandom__c)
+			        	purgeDetailsSetting = getRandomPurgeRecordsList(purgeDetailsSetting);
+		        	}
+		        }
+		        for(Purge_Details__c currentSetting: purgeDetailsSetting) {
+		            try{
+		                if(currentSetting.isActive__c){
+		                    SOBJECT_NAME = currentSetting.Object_Name__c ;
+		                    WHERE_CLAUSE = ' WHERE ' + currentSetting.Criteria__c;
+		                    threshold = Integer.valueOf(currentSetting.Threshold__c);  
+		                    recordLimit = Integer.valueOf(currentSetting.Limit__c);
+		                    Integer qryLmt= Limits.getLimitQueries()-Limits.getQueries();
+		                    Integer qryrowLmts= Limits.getLimitQueryRows()-Limits.getQueryRows(); 
+		                    if(qryLmt<=QUERYLIMIT || qryrowLmts<=QUERY_ROW_LIMIT || qryrowLmts<=integer.valueOf(threshold)){
+		                      break;
+		                    }  
+		                    String queryString = 'SELECT count() FROM ' + SOBJECT_NAME + ' ' + WHERE_CLAUSE + ' '+ 'LIMIT '+(threshold + recordLimit); 
+		                    queryResultCount = Database.countQuery(queryString);
+		                    if(queryResultCount > threshold){
+			                    LIMIT_CLAUSE = ' LIMIT ' + (queryResultCount-threshold) ;
+			                    String queryStr = 'SELECT Id FROM ' + SOBJECT_NAME + ' ' + WHERE_CLAUSE + ' ' + LIMIT_CLAUSE;
+						        recordSet = Database.getQueryLocator(queryStr);	
+			                    break;
+			                }
+		                }
+		            }catch(Exception e){
+		               createErrorLogList(SOBJECT_NAME, e.getMessage());   
+		               Continue;
+		            }
+		        }
+	        }
+        }catch(Exception e){
+        	createErrorLogList(SOBJECT_NAME, e.getMessage());
+        }
+        if(recordSet == null){
+        	isExit = true;	
+        	return Database.getQueryLocator('SELECT Id FROM Account LIMIT 0');
+        }
+        return recordSet;      
+    }
+    
+   /**
+     * Method:
+     * EXECUTE
+     * 
+     * Summary:
+     * This method is implimentation of Database.Batchable interface.
+     * Actual records opertation has started from this method.
+     * 
+     * Parameters:
+     * @ Database.BatchableContext context
+     * @ List<SOBject> objects
+     * 
+     * Return Type: 
+     * @ void
+     */
+    global void execute(Database.BatchableContext context, List<SOBject> objects) {
+        try{
+	        if(objects.size() > 0){
+		        //delete records;
+		        Database.DeleteResult[] drList = database.delete(objects, false);
+		        	Map<String, String> mapFailedRecordsDetails = new Map<String, String>();
+		        		// Iterate through each returned result
+						for(Database.DeleteResult dr : drList) {
+						    if (!dr.isSuccess()) {
+						       // Operation failed, so get all errors
+						       String errorMessage;                
+						        for(Database.Error err : dr.getErrors()) {
+						            errorMessage += 'Status Code: '+err.getStatusCode()+' ErrorMessage:'+err.getMessage()+' Affected Field:'+err.getFields()+'\n';                    
+						        }
+						        mapFailedRecordsDetails.put(dr.getId(), errorMessage);
+						    }
+						}
+		        if(mapFailedRecordsDetails.size() > 0){
+		        	String message = String.valueOf(mapFailedRecordsDetails.keySet());
+	        		Util.createErrorLog('Batch_PurgeRecords:Failed RecordId', 'Batch_PurgeRecords', 'execute', null, true, 'Failed RecordIds: '+message, 'Database.BatchableContext context, List<SOBject> objects, : OBJECTNAME: '+SOBJECT_NAME);
+	        		Util.insertErrorLogs();
+		        }
+		        //Delete Permanently. cannot be undeleted
+		        Database.emptyRecycleBin(objects);
+	        }
+        }catch(Exception e){
+        	Util.createErrorLog('Batch_PurgeRecords:Exception', 'Batch_PurgeRecords', 'execute', null, true, 'Exception: '+e.getMessage(), 'Database.BatchableContext context, List<SOBject> objects, : OBJECTNAME: '+SOBJECT_NAME);
+	        Util.insertErrorLogs();
+        }
+}
+    
+   /**
+     * Method:
+     * FINISH
+     * 
+     * Summary:
+     * This method is implimentation of Database.Batchable interface.
+     * Once batch completed with operation on record then finish method get called for final operation.
+     * 
+     * Parameters:
+     * @ Database.BatchableContext context
+     * @ List<SOBject> objects
+     * 
+     * Return Type: 
+     * @ void
+     */
+    global void finish(Database.BatchableContext context) {
+       try{
+	       if(!lstErrorLog.isEmpty()){
+	        database.insert(lstErrorLog, false);
+	        lstErrorLog.clear();
+	       }
+	       if(!isExit){
+	       	database.executeBatch(new Batch_PurgeRecords());
+	       }
+       }catch(Exception e){
+       		Util.createErrorLog('Batch_PurgeRecords:Exception', 'Batch_PurgeRecords', 'finish', null, true, 'Exception: '+e.getMessage(), 'Database.BatchableContext context, OBJECTNAME');
+	        Util.insertErrorLogs();
+       }
+    }
+    
+   /**
+     * Method:
+     * execute
+     * 
+     * Summary:
+     * This method is implimentation of schedulable interface.
+     * This method used to schedule batch job with scheduler time.
+     * 
+     * Parameters:
+     * @ SchedulableContext SC
+     * 
+     * Return Type: 
+     * @ void
+     *
+     * Schdule batch execution code:
+     *     Datetime sysTime = System.now();
+     *     sysTime = sysTime.addminutes(5);
+     *     String schedule_Time = ' '+sysTime.second()+' '+ sysTime.minute() + ' ' + sysTime.hour() + 
+     *       ' ' + sysTime.day() + ' ' + sysTime.month() + ' ? ' + sysTime.year();
+     *     system.Schedule('Batch_PurgeRecords_Scheduled',schedule_Time,new Batch_PurgeRecords());
+     */
+    global void execute(SchedulableContext SC){
+        //check if there are 5 active batch jobs
+        List<AsyncApexJob> lstAsyncJob = [SELECT Id FROM AsyncApexJob WHERE JobType='BatchApex' AND ApexClass.Name = 'Batch_PurgeRecords' AND (Status = 'Processing' OR Status = 'Preparing' OR Status = 'Queued')];
+        if([Select count() FROM AsyncApexJob WHERE JobType='BatchApex' AND(Status = 'Processing' OR Status = 'Preparing' OR Status = 'Queued')] < 5 && lstAsyncJob.isEmpty()){
+        	if(String.isNotEmpty(SOBJECT_NAME.trim()) && String.isNotEmpty(WHERE_CLAUSE_VALUE.trim())){
+            	Database.executebatch(new Batch_PurgeRecords(SOBJECT_NAME, WHERE_CLAUSE_VALUE, LIMIT_VALUE));
+        	}else{   
+            	Database.executebatch(new Batch_PurgeRecords());
+            }
+        }else{
+            //schedule this same class again in 30 minutes
+            Batch_PurgeRecords bagain;
+            if(String.isNotEmpty(SOBJECT_NAME.trim()) && String.isNotEmpty(WHERE_CLAUSE_VALUE.trim())){
+            	bagain = new Batch_PurgeRecords(SOBJECT_NAME, WHERE_CLAUSE_VALUE, LIMIT_VALUE);
+        	}else{
+            	bagain = new Batch_PurgeRecords();
+            }
+            Datetime dt = Datetime.now() + (0.024305); // i.e. 30 mins
+            String timeForScheduler = dt.format('s m H d M \'?\' yyyy');
+            system.Schedule('Batch_PurgeRecords_ReScheduled'+timeForScheduler,timeForScheduler,bagain);
+        }
+    
+    }
+    
+    /**
+     * Method:
+     * getRandomPurgeRecordsList
+     * 
+     * Summary:
+     * This method is used to generate random record list.
+     * 
+     * Parameters:
+     * @ List<Purge_Details__c> listObj
+     * 
+     * Return Type: 
+     * @ List<Purge_Details__c>
+     */
+    //Below method used for getting random record list from given record list.
+    private List<Purge_Details__c> getRandomPurgeRecordsList(List<Purge_Details__c> listObj){
+    	List<Purge_Details__c> lstPurgeDetails = new List<Purge_Details__c>();
+		set<Purge_Details__c> setPurgeDetails = new set<Purge_Details__c>();
+		while(!listObj.isEmpty()){
+			Integer index = Math.mod(Math.abs(Crypto.getRandomInteger()),listObj.size());
+			if(!setPurgeDetails.contains( listObj.get(index))){
+				setPurgeDetails.add(listObj.get(index));
+				lstPurgeDetails.add(listObj.get(index));
+			}
+			if(setPurgeDetails.containsAll(listObj))
+			break;
+		}
+		return lstPurgeDetails;
+    }
+    
+    /**
+     * Method:
+     * createErrorLogList
+     * 
+     * Summary:
+     * This method is used to create error log list if start method throwing any exception.
+     * 
+     * Parameters:
+     * @ String sObjectName, String errorMessage
+     * 
+     * Return Type: 
+     * @ void
+     */
+    private void createErrorLogList(String sObjectName, String errorMessage){
+    	Error_Log__c log = new Error_Log__c();
+            log.Name = 'Batch_PurgeRecords : '+sObjectName;
+            log.Is_Exception__c = true;
+            log.Exception_Message__c = 'ERROR : '+errorMessage;
+            log.Class_Name__c = 'Batch_PurgeRecords';
+            log.Method_Name__c = 'START';
+            log.Parameters__c = 'Database.BatchableContext context : OBJECT NAME: '+sObjectName;
+            lstErrorLog.add(log); 
+    }
+}
